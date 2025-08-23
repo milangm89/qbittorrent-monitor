@@ -1,0 +1,16 @@
+services:
+  qbittorrent-monitor:
+    image: milangeorge/qbittorrent-monitor:latest
+    container_name: qbittorrent-monitor
+    restart: unless-stopped
+    user: '568:568'  # apps user with UID and GID of the system user
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    environment:
+      - TZ=Europe/London
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
