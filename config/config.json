@@ -1,0 +1,26 @@
+{
+    "instances": [
+        {
+            "name": "qbit-instance1",
+            "url": "https://qbit.example.com",
+            "username": "admin",
+            "password": "adminadmin",
+            "enabled": true,
+            "check_interval": 30,
+            "max_retries": 5,
+            "retry_delay": 10,
+            "folder_retry_delay": 30
+        },
+        {
+            "name": "qbit-instance2",
+            "url": "https://qbit.example2.com",
+            "username": "admin",
+            "password": "adminadmin",
+            "enabled": true,
+            "check_interval": 45,
+            "max_retries": 5,
+            "retry_delay": 10,
+            "folder_retry_delay": 30
+        }
+    ]
+}
