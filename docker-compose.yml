@@ -1,14 +1,30 @@
+version: '3.8'
+
 services:
   qbittorrent-monitor:
     image: milangeorge/qbittorrent-monitor:latest
     container_name: qbittorrent-monitor
     restart: unless-stopped
-    user: '568:568'  # apps user with UID and GID of the system user
-    volumes:
-      - ./config:/app/config
-      - ./logs:/app/logs
+    user: "1001:1001"  # apps user for TrueNAS
     environment:
-      - TZ=Europe/London
+      # First qBittorrent instance
+      - QBITTORRENT_0_NAME=main
+      - QBITTORRENT_0_URL=http://192.168.1.100:8080
+      - QBITTORRENT_0_USERNAME=admin
+      - QBITTORRENT_0_PASSWORD=adminadmin
+      - QBITTORRENT_0_CHECK_INTERVAL=30
+      
+      # Second qBittorrent instance (optional)
+      - QBITTORRENT_1_NAME=backup
+      - QBITTORRENT_1_URL=http://192.168.1.101:8080
+      - QBITTORRENT_1_USERNAME=admin
+      - QBITTORRENT_1_PASSWORD=adminadmin
+      - QBITTORRENT_1_CHECK_INTERVAL=45
+      
+      # Global settings
+      - TZ=UTC
+    volumes:
+      - ./logs:/app/logs
     logging:
       driver: json-file
       options:

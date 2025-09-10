@@ -4,18 +4,24 @@ A Docker container that monitors multiple qBittorrent instances and automaticall
 
 ## Features
 
-- Monitor multiple qBittorrent instances simultaneously
+- Monitor multiple qBittorrent instances simultaneously via environment variables
 - Automatically remove domain names from torrent titles, folders, and filenames
 - Multi-architecture support (x86_64 and ARM64)
 - Runs as non-root user (appuser) with configurable UID/GID
-- Persistent logging and configuration
+- Persistent logging
 - Retry logic for failed operations
-- Docker Compose ready
+- Docker Compose ready with environment variable support
 
 ## Quick Start
 
-1. Clone this repository
-2. Edit `config/config.json` with your qBittorrent instances
-3. Run with Docker Compose:
-   ```bash
-   docker-compose up -d
+### Method 1: Direct Environment Variables
+```bash
+docker run -d \
+  --name qbittorrent-monitor \
+  --user 1001:1001 \
+  -e QBITTORRENT_0_NAME=main \
+  -e QBITTORRENT_0_URL=http://192.168.1.100:8080 \
+  -e QBITTORRENT_0_USERNAME=admin \
+  -e QBITTORRENT_0_PASSWORD=adminadmin \
+  -v ./logs:/app/logs \
+  milangeorge/qbittorrent-monitor:latest

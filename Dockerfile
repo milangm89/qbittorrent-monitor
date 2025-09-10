@@ -1,7 +1,4 @@
-FROM --platform=$TARGETPLATFORM python:3.9-slim
-
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
+FROM python:3.9-slim
 
 WORKDIR /app
 
@@ -10,19 +7,17 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY qbittorrent_multi_monitor.py .
+COPY qbittorrent_monitor_env.py .
 
 # Create directories
-RUN mkdir -p /app/logs /app/config
+RUN mkdir -p /app/logs
 
-# Create default config if it doesn't exist
-RUN echo '{"instances": []}' > /app/config/config.json
+# Create non-root user (appuser)
+RUN useradd --create-home --shell /bin/bash appuser && \
+    chown -R appuser:appuser /app
 
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash appuser
-RUN chown -R appuser:appuser /app
 USER appuser
 
-VOLUME ["/app/logs", "/app/config"]
+VOLUME ["/app/logs"]
 
-CMD ["python", "qbittorrent_multi_monitor.py"]
+CMD ["python", "qbittorrent_monitor_env.py"]

@@ -7,6 +7,7 @@ from datetime import datetime
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 # Configure logging
 logging.basicConfig(
@@ -19,18 +20,16 @@ logging.basicConfig(
 )
 
 class QBittorrentInstance:
-    def __init__(self, config):
-        self.name = config.get('name', 'unnamed')
-        self.base_url = config['url']
-        self.username = config['username']
-        self.password = config['password']
-        self.enabled = config.get('enabled', True)
-        self.check_interval = config.get('check_interval', 30)
-        self.max_retries = config.get('max_retries', 5)  # Increased retries
-        self.retry_delay = config.get('retry_delay', 10)  # Increased delay
-        self.folder_retry_delay = config.get('folder_retry_delay', 30)  # Special delay for folders
+    def __init__(self, name, url, username, password, check_interval=30, max_retries=5, retry_delay=10, folder_retry_delay=30):
+        self.name = name
+        self.base_url = url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.check_interval = int(check_interval)
+        self.max_retries = int(max_retries)
+        self.retry_delay = int(retry_delay)
+        self.folder_retry_delay = int(folder_retry_delay)
         self.session = requests.Session()
-        self.processed_torrents = set()
         self.last_error_time = None
         self.error_count = 0
 
@@ -92,19 +91,6 @@ class QBittorrentInstance:
             logging.error(f"[{self.name}] Error fetching torrent files for {torrent_hash}: {e}")
             return []
 
-    def get_torrent_properties(self, torrent_hash):
-        """Get torrent properties to check state"""
-        try:
-            response = self.session.get(f'{self.base_url}/api/v2/torrents/properties?hash={torrent_hash}', timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logging.debug(f"[{self.name}] Could not get properties for torrent {torrent_hash}: HTTP {response.status_code}")
-                return None
-        except Exception as e:
-            logging.debug(f"[{self.name}] Error getting torrent properties for {torrent_hash}: {e}")
-            return None
-
     def rename_torrent(self, torrent_hash, new_name):
         """Rename a torrent with retry logic"""
         for attempt in range(self.max_retries):
@@ -155,29 +141,49 @@ class QBittorrentInstance:
         return False
 
 class QBittorrentMultiMonitor:
-    def __init__(self, config_path='/app/config/config.json'):
-        self.instances = []
-        self.load_config(config_path)
+    def __init__(self):
+        self.instances = self.load_instances_from_env()
         self.running = False
 
-    def load_config(self, config_path):
-        """Load configuration from JSON file"""
-        try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            
-            # Create instances for each qBittorrent server
-            for instance_config in config.get('instances', []):
-                if instance_config.get('enabled', True):
-                    instance = QBittorrentInstance(instance_config)
-                    self.instances.append(instance)
-                    logging.info(f"Added qBittorrent instance: {instance.name} ({instance.base_url})")
-            
-            if not self.instances:
-                logging.warning("No qBittorrent instances configured or all disabled")
+    def load_instances_from_env(self):
+        """Load qBittorrent instances from environment variables"""
+        instances = []
+        
+        # Look for environment variables with pattern QBITTORRENT_<INDEX>_<PROPERTY>
+        index = 0
+        while True:
+            url_var = f'QBITTORRENT_{index}_URL'
+            if url_var not in os.environ:
+                break
                 
-        except Exception as e:
-            logging.error(f"Error loading config: {e}")
+            url = os.environ[url_var]
+            name = os.environ.get(f'QBITTORRENT_{index}_NAME', f'qbit-{index}')
+            username = os.environ.get(f'QBITTORRENT_{index}_USERNAME', 'admin')
+            password = os.environ.get(f'QBITTORRENT_{index}_PASSWORD', 'adminadmin')
+            check_interval = os.environ.get(f'QBITTORRENT_{index}_CHECK_INTERVAL', '30')
+            max_retries = os.environ.get(f'QBITTORRENT_{index}_MAX_RETRIES', '5')
+            retry_delay = os.environ.get(f'QBITTORRENT_{index}_RETRY_DELAY', '10')
+            folder_retry_delay = os.environ.get(f'QBITTORRENT_{index}_FOLDER_RETRY_DELAY', '30')
+            
+            instance = QBittorrentInstance(
+                name=name,
+                url=url,
+                username=username,
+                password=password,
+                check_interval=check_interval,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                folder_retry_delay=folder_retry_delay
+            )
+            
+            instances.append(instance)
+            logging.info(f"Added qBittorrent instance: {name} ({url})")
+            index += 1
+        
+        if not instances:
+            logging.warning("No qBittorrent instances configured via environment variables")
+            
+        return instances
 
     def extract_domain(self, text):
         """Extract domain from text containing URLs"""
@@ -251,13 +257,6 @@ class QBittorrentMultiMonitor:
                         paths.add(path)
         return sorted(list(paths))
 
-    def is_folder_empty_path(self, folder_path, all_files):
-        """Check if a folder path is actually just part of another path"""
-        for file in all_files:
-            if file['name'].startswith(folder_path + '/') and len(file['name']) > len(folder_path) + 1:
-                return False
-        return True
-
     def process_torrent_paths(self, instance, torrent_hash, files):
         """Process all paths (folders and files) in a torrent"""
         processed_count = 0
@@ -267,10 +266,6 @@ class QBittorrentMultiMonitor:
         logging.debug(f"[{instance.name}] Found folder paths: {folder_paths}")
         
         # Process folders (from deepest to shallowest to avoid conflicts)
-        # But we need to be careful about the order and handle conflicts
-        processed_folders = {}  # Keep track of renamed folders
-        
-        # Sort folders by depth (deepest first) to avoid path conflicts
         sorted_folders = sorted(folder_paths, key=lambda x: x.count('/'), reverse=True)
         
         for folder_path in sorted_folders:
@@ -281,14 +276,12 @@ class QBittorrentMultiMonitor:
                     logging.info(f'[{instance.name}]   Renaming folder: "{folder_path}" -> "{new_folder_path}"')
                     if instance.rename_file(torrent_hash, folder_path, new_folder_path, is_folder=True):
                         processed_count += 1
-                        processed_folders[folder_path] = new_folder_path
                         # Update file paths to reflect folder renaming
                         for file in files:
                             if file['name'].startswith(folder_path + '/'):
                                 file['name'] = new_folder_path + file['name'][len(folder_path):]
                     else:
                         logging.error(f'[{instance.name}]   Failed to rename folder: "{folder_path}"')
-                        # Even if renaming failed, we should still try to process files in this folder
                 else:
                     logging.debug(f'[{instance.name}]   Folder name unchanged: "{folder_path}"')
             else:
@@ -367,7 +360,7 @@ class QBittorrentMultiMonitor:
                         time.sleep(instance.check_interval)
                     continue
                 
-                # Process torrents (for simplicity, we'll process all torrents each time)
+                # Process torrents
                 for torrent in torrents:
                     try:
                         self.process_torrent(instance, torrent)
@@ -379,7 +372,7 @@ class QBittorrentMultiMonitor:
             except Exception as e:
                 logging.error(f"[{instance.name}] Error in monitoring loop: {e}")
                 instance.handle_error()
-                time.sleep(60)  # Wait longer on error
+                time.sleep(60)
 
     def start(self):
         """Start monitoring all instances"""
@@ -395,7 +388,7 @@ class QBittorrentMultiMonitor:
             futures = [executor.submit(self.monitor_instance, instance) for instance in self.instances]
             
             try:
-                # Wait for all threads (they won't complete normally)
+                # Wait for all threads
                 for future in futures:
                     future.result()
             except KeyboardInterrupt:
