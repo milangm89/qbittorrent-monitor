@@ -164,6 +164,44 @@ class QBittorrentInstance:
             logging.debug(f"[{self.name}] Error getting torrent properties for {torrent_hash}: {e}")
             return None
 
+    def pause_torrent(self, torrent_hash):
+        """Pause a torrent"""
+        try:
+            data = {'hashes': torrent_hash}
+            response = self.session.post(
+                f'{self.base_url}/api/v2/torrents/pause', 
+                data=data, 
+                timeout=(10, self.connection_timeout)
+            )
+            if response.status_code == 200:
+                logging.info(f"[{self.name}] Paused torrent {torrent_hash}")
+                return True
+            else:
+                logging.warning(f"[{self.name}] Failed to pause torrent {torrent_hash}: HTTP {response.status_code}")
+                return False
+        except Exception as e:
+            logging.error(f"[{self.name}] Error pausing torrent {torrent_hash}: {e}")
+            return False
+
+    def resume_torrent(self, torrent_hash):
+        """Resume a torrent"""
+        try:
+            data = {'hashes': torrent_hash}
+            response = self.session.post(
+                f'{self.base_url}/api/v2/torrents/resume', 
+                data=data, 
+                timeout=(10, self.connection_timeout)
+            )
+            if response.status_code == 200:
+                logging.info(f"[{self.name}] Resumed torrent {torrent_hash}")
+                return True
+            else:
+                logging.warning(f"[{self.name}] Failed to resume torrent {torrent_hash}: HTTP {response.status_code}")
+                return False
+        except Exception as e:
+            logging.error(f"[{self.name}] Error resuming torrent {torrent_hash}: {e}")
+            return False
+
     def rename_torrent(self, torrent_hash, new_name):
         """Rename a torrent with retry logic"""
         for attempt in range(self.max_retries):
@@ -194,7 +232,7 @@ class QBittorrentInstance:
         return False
 
     def rename_file(self, torrent_hash, old_path, new_path, is_folder=False):
-        """Rename a file/folder in torrent with retry logic"""
+        """Rename a file/folder in torrent with retry logic and torrent pausing for conflicts"""
         max_retries = self.max_retries
         retry_delay = self.retry_delay if not is_folder else self.folder_retry_delay
         
@@ -212,6 +250,26 @@ class QBittorrentInstance:
                     return True
                 elif response.status_code == 409:
                     logging.warning(f"[{self.name}] Conflict when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): File may be in use")
+                    # If it's a folder and we're getting conflicts, try pausing the torrent first
+                    if is_folder and attempt >= 2:  # Try pausing after 2 failed attempts
+                        logging.info(f"[{self.name}] Attempting to pause torrent {torrent_hash} before renaming folder...")
+                        if self.pause_torrent(torrent_hash):
+                            time.sleep(5)  # Wait for torrent to pause
+                            # Try renaming again after pause
+                            response_retry = self.session.post(
+                                f'{self.base_url}/api/v2/torrents/renameFile', 
+                                data=data, 
+                                timeout=(10, self.connection_timeout)
+                            )
+                            if response_retry.status_code == 200:
+                                logging.info(f"[{self.name}] Successfully renamed {'folder' if is_folder else 'file'} after pausing torrent")
+                                self.resume_torrent(torrent_hash)  # Resume after successful rename
+                                return True
+                            else:
+                                # Resume torrent even if rename failed
+                                self.resume_torrent(torrent_hash)
+                        else:
+                            logging.error(f"[{self.name}] Failed to pause torrent {torrent_hash}")
                 elif response.status_code == 400:
                     logging.error(f"[{self.name}] Bad request when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): {response.text}")
                     break  # Don't retry on bad requests
@@ -254,9 +312,9 @@ class QBittorrentMultiMonitor:
             username = os.environ.get(f'QBITTORRENT_{index}_USERNAME', 'admin')
             password = os.environ.get(f'QBITTORRENT_{index}_PASSWORD', 'adminadmin')
             check_interval = os.environ.get(f'QBITTORRENT_{index}_CHECK_INTERVAL', '30')
-            max_retries = os.environ.get(f'QBITTORRENT_{index}_MAX_RETRIES', '5')
-            retry_delay = os.environ.get(f'QBITTORRENT_{index}_RETRY_DELAY', '10')
-            folder_retry_delay = os.environ.get(f'QBITTORRENT_{index}_FOLDER_RETRY_DELAY', '30')
+            max_retries = os.environ.get(f'QBITTORRENT_{index}_MAX_RETRIES', '8')  # Increased retries
+            retry_delay = os.environ.get(f'QBITTORRENT_{index}_RETRY_DELAY', '15')
+            folder_retry_delay = os.environ.get(f'QBITTORRENT_{index}_FOLDER_RETRY_DELAY', '45')  # Increased for folders
             connection_timeout = os.environ.get(f'QBITTORRENT_{index}_CONNECTION_TIMEOUT', '30')
             
             instance = QBittorrentInstance(
@@ -283,24 +341,18 @@ class QBittorrentMultiMonitor:
     def extract_domain_v2(self, text):
         """Enhanced domain extraction with better validation"""
         # Look for actual URLs or domains with common patterns
-        # This regex matches: http://domain.com, https://domain.com, www.domain.com
-        # But with stricter validation to avoid false positives
         url_pattern = r'(?:https?://)?(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
         matches = re.findall(url_pattern, text, re.IGNORECASE)
         
-        # Validate matches more carefully - only match if it's part of a proper URL pattern
         for match in matches:
-            # Look for the full match in context
             full_match = re.search(r'(?:https?://)?(?:www\.)?' + re.escape(match), text, re.IGNORECASE)
             if full_match:
                 full_url = full_match.group(0)
-                # Check if it's a proper domain pattern by looking for common indicators
                 if ('http://' in full_url.lower() or 
                     'https://' in full_url.lower() or 
                     'www.' in full_url.lower() or
                     any(tld in full_url.lower() for tld in ['.com', '.org', '.net', '.tv', '.io', '.co', '.uk', '.de', '.fr', '.ru', '.kim', '.xyz', '.top', '.site', '.info'])):
-                    # Additional validation: make sure it's not just a word.word pattern
-                    if len(match) > 6 and match.count('.') <= 2:  # At least 6 chars, max 2 dots
+                    if len(match) > 6 and match.count('.') <= 2:
                         return full_url
         
         return None
@@ -325,12 +377,10 @@ class QBittorrentMultiMonitor:
                 base_name = file_parts[0]
                 file_extension = '.' + file_parts[1]
                 
-                # Remove domain from base name only - using more specific replacement
+                # Remove domain from base name only
                 cleaned_base = base_name
                 if domain in base_name:
-                    # Remove the full domain match
                     cleaned_base = re.sub(re.escape(domain), '', cleaned_base, flags=re.IGNORECASE)
-                    # Clean up surrounding characters but preserve meaningful separators
                     cleaned_base = re.sub(r'[-_.\[\](){}]+', ' ', cleaned_base)
                     cleaned_base = re.sub(r'\s+', ' ', cleaned_base).strip()
                 
@@ -345,7 +395,6 @@ class QBittorrentMultiMonitor:
                 cleaned_name = filename
                 if domain in filename:
                     cleaned_name = re.sub(re.escape(domain), '', cleaned_name, flags=re.IGNORECASE)
-                    # Clean up surrounding characters but preserve meaningful separators
                     cleaned_name = re.sub(r'[-_.\[\](){}]+', ' ', cleaned_name)
                     cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
                 
