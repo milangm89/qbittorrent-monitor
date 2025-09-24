@@ -211,17 +211,33 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
     def pause_torrent(self, torrent_hash):
         """Pause a torrent"""
         try:
-            data = {'hashes': torrent_hash}
+            normalized_hash = self._normalize_torrent_hash(torrent_hash)
+            data = {'hashes': normalized_hash}
+            url = f'{self.base_url}/api/v2/torrents/pause'
+            logging.debug("[%s] Attempting to pause torrent %s (normalized: %s) using URL: %s", 
+                         self.name, torrent_hash, normalized_hash, url)
+            
             response = self.session.post(
-                f'{self.base_url}/api/v2/torrents/pause',
+                url,
                 data=data,
                 timeout=(10, self.connection_timeout)
             )
+            
+            logging.debug("[%s] Pause response: HTTP %s, Content: %s", 
+                         self.name, response.status_code, response.text[:200])
+            
             if response.status_code == 200:
                 logging.info("[%s] Paused torrent %s", self.name, torrent_hash)
                 return True
-            logging.warning("[%s] Failed to pause torrent %s: HTTP %s",
-                           self.name, torrent_hash, response.status_code)
+                
+            # Handle different error codes
+            if response.status_code == 404:
+                logging.error("[%s] Torrent %s not found (HTTP 404). "
+                             "It may have been removed or the hash is incorrect.", 
+                             self.name, torrent_hash)
+            else:
+                logging.warning("[%s] Failed to pause torrent %s: HTTP %s - %s",
+                               self.name, torrent_hash, response.status_code, response.text)
             return False
         except Exception as e:  # pylint: disable=broad-exception-caught
             logging.error("[%s] Error pausing torrent %s: %s", self.name, torrent_hash, e)
@@ -230,17 +246,32 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
     def resume_torrent(self, torrent_hash):
         """Resume a torrent"""
         try:
-            data = {'hashes': torrent_hash}
+            normalized_hash = self._normalize_torrent_hash(torrent_hash)
+            data = {'hashes': normalized_hash}
+            url = f'{self.base_url}/api/v2/torrents/resume'
+            logging.debug("[%s] Attempting to resume torrent %s (normalized: %s) using URL: %s", 
+                         self.name, torrent_hash, normalized_hash, url)
+            
             response = self.session.post(
-                f'{self.base_url}/api/v2/torrents/resume',
+                url,
                 data=data,
                 timeout=(10, self.connection_timeout)
             )
+            
+            logging.debug("[%s] Resume response: HTTP %s, Content: %s", 
+                         self.name, response.status_code, response.text[:200])
+            
             if response.status_code == 200:
                 logging.info("[%s] Resumed torrent %s", self.name, torrent_hash)
                 return True
-            logging.warning("[%s] Failed to resume torrent %s: HTTP %s",
-                           self.name, torrent_hash, response.status_code)
+                
+            # Handle different error codes
+            if response.status_code == 404:
+                logging.error("[%s] Torrent %s not found (HTTP 404) during resume. "
+                             "It may have been removed.", self.name, torrent_hash)
+            else:
+                logging.warning("[%s] Failed to resume torrent %s: HTTP %s - %s",
+                               self.name, torrent_hash, response.status_code, response.text)
             return False
         except Exception as e:  # pylint: disable=broad-exception-caught
             logging.error("[%s] Error resuming torrent %s: %s", self.name, torrent_hash, e)
@@ -300,21 +331,54 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
                          self.name, torrent_hash, e)
             return 'unknown', 0
 
+    def _normalize_torrent_hash(self, torrent_hash):
+        """Normalize torrent hash format for API calls"""
+        if not torrent_hash:
+            return torrent_hash
+        
+        # qBittorrent API typically expects lowercase hashes
+        normalized = torrent_hash.lower().strip()
+        
+        # Basic validation - should be 40 character hex string
+        if len(normalized) != 40 or not all(c in '0123456789abcdef' for c in normalized):
+            logging.warning("[%s] Torrent hash format may be invalid: %s", 
+                           self.name, torrent_hash)
+        
+        return normalized
+
     def _force_complete_torrent(self, torrent_hash):
         """Force complete a torrent to release file locks"""
         try:
-            data = {'hashes': torrent_hash}
+            normalized_hash = self._normalize_torrent_hash(torrent_hash)
+            data = {'hashes': normalized_hash}
+            url = f'{self.base_url}/api/v2/torrents/setForceStart'
+            logging.debug("[%s] Attempting to force start torrent %s (normalized: %s) using URL: %s", 
+                         self.name, torrent_hash, normalized_hash, url)
+            
             response = self.session.post(
-                f'{self.base_url}/api/v2/torrents/setForceStart',
+                url,
                 data=data,
                 timeout=(10, self.connection_timeout)
             )
+            
+            logging.debug("[%s] Force start response: HTTP %s, Content: %s", 
+                         self.name, response.status_code, response.text[:200])
+            
             if response.status_code == 200:
                 logging.info("[%s] Force started torrent %s", self.name, torrent_hash)
                 time.sleep(2)  # Wait a bit
                 # Now pause it
-                self.pause_torrent(torrent_hash)
-                return True
+                pause_result = self.pause_torrent(torrent_hash)
+                if not pause_result:
+                    logging.warning("[%s] Force start succeeded but pause failed for %s", 
+                                   self.name, torrent_hash)
+                return pause_result  # Only return True if both succeeded
+            elif response.status_code == 404:
+                logging.error("[%s] Torrent %s not found (HTTP 404) during force start. "
+                             "It may have been removed.", self.name, torrent_hash)
+            else:
+                logging.warning("[%s] Failed to force start torrent %s: HTTP %s - %s",
+                               self.name, torrent_hash, response.status_code, response.text)
             return False
         except Exception as e:  # pylint: disable=broad-exception-caught
             logging.error("[%s] Error force starting torrent %s: %s", self.name, torrent_hash, e)
@@ -330,6 +394,7 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
         strategies = [
             ("pause", lambda: self.pause_torrent(torrent_hash)),
             ("force_complete_then_pause", lambda: self._force_complete_torrent(torrent_hash)),
+            ("wait_and_retry", lambda: True),  # Always succeeds, just waits longer
         ]
         
         for strategy_name, strategy_func in strategies:
@@ -342,9 +407,15 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
             
             # Wait longer for folders as they might have more file handles
             # Also wait longer if torrent is actively downloading/seeding
-            base_wait = 10 if attempt > 0 else 5
-            if state in ['downloading', 'uploading', 'stalledDL', 'stalledUP']:
-                base_wait *= 2
+            if strategy_name == "wait_and_retry":
+                # For the wait_and_retry strategy, use much longer waits
+                base_wait = 30 + (attempt * 10)  # 30, 40, 50, ... seconds
+                logging.info("[%s] Using extended wait strategy: %s seconds", 
+                            self.name, base_wait)
+            else:
+                base_wait = 10 if attempt > 0 else 5
+                if state in ['downloading', 'uploading', 'stalledDL', 'stalledUP']:
+                    base_wait *= 2
             
             logging.info("[%s] Waiting %s seconds after %s (torrent was %s)...", 
                         self.name, base_wait, strategy_name, state)
@@ -370,14 +441,16 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
                     logging.warning("[%s] Still getting conflict after %s strategy, "
                                    "torrent state: %s", self.name, strategy_name, new_state)
                 else:
-                    logging.warning("[%s] Got HTTP %s after %s strategy", 
-                                  self.name, response_retry.status_code, strategy_name)
+                    logging.warning("[%s] Got HTTP %s after %s strategy: %s", 
+                                  self.name, response_retry.status_code, strategy_name, 
+                                  response_retry.text[:100])
             except Exception as e:  # pylint: disable=broad-exception-caught
                 logging.error("[%s] Error during rename after %s: %s", 
                              self.name, strategy_name, e)
             finally:
-                # Always try to resume the torrent
-                self.resume_torrent(torrent_hash)
+                # Only try to resume if we actually paused (and it worked)
+                if strategy_name in ["pause", "force_complete_then_pause"]:
+                    self.resume_torrent(torrent_hash)
             
             # Small delay before trying next strategy
             if strategy_name != strategies[-1][0]:  # Not the last strategy
