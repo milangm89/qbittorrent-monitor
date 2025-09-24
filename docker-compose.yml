@@ -5,7 +5,7 @@ services:
     image: milangeorge/qbittorrent-monitor:latest
     container_name: qbittorrent-monitor
     restart: unless-stopped
-    user: "1001:1001"  # apps user for TrueNAS
+    user: "1001:1001" # apps user for TrueNAS
     environment:
       # First qBittorrent instance
       - QBITTORRENT_0_NAME=main
@@ -17,8 +17,7 @@ services:
       - QBITTORRENT_0_CONNECTION_TIMEOUT=60
       - QBITTORRENT_0_MAX_RETRIES=8
       - QBITTORRENT_0_RETRY_DELAY=15
-      - QBITTORRENT_0_FOLDER_RETRY_DELAY=45  # Longer delay for folders
-      
+      - QBITTORRENT_0_FOLDER_RETRY_DELAY=45 # Longer delay for folders
       # Second qBittorrent instance (optional)
       - QBITTORRENT_1_NAME=backup
       - QBITTORRENT_1_URL=http://192.168.1.101:8080
@@ -29,9 +28,6 @@ services:
       - QBITTORRENT_1_MAX_RETRIES=8
       - QBITTORRENT_1_RETRY_DELAY=15
       - QBITTORRENT_1_FOLDER_RETRY_DELAY=45
-
-
-      
       # Global settings
       - TZ=UTC
     volumes:
