@@ -148,6 +148,22 @@ class QBittorrentInstance:
             logging.error(f"[{self.name}] Error fetching torrent files for {torrent_hash}: {e}")
             return []
 
+    def get_torrent_properties(self, torrent_hash):
+        """Get torrent properties to check state"""
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/v2/torrents/properties?hash={torrent_hash}', 
+                timeout=(10, self.connection_timeout)
+            )
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logging.debug(f"[{self.name}] Could not get properties for torrent {torrent_hash}: HTTP {response.status_code}")
+                return None
+        except Exception as e:
+            logging.debug(f"[{self.name}] Error getting torrent properties for {torrent_hash}: {e}")
+            return None
+
     def rename_torrent(self, torrent_hash, new_name):
         """Rename a torrent with retry logic"""
         for attempt in range(self.max_retries):
@@ -264,49 +280,28 @@ class QBittorrentMultiMonitor:
             
         return instances
 
-    def extract_domain(self, text):
-        """Extract domain from text containing URLs - More precise regex"""
-        # Look for actual URLs with protocols or www prefixes
-        # This regex matches: http://domain.com, https://domain.com, www.domain.com
-        domain_pattern = r'(?:https?://)?(?:www\.)?([a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.)+[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
-        
-        # Find all potential domain matches
-        matches = re.findall(domain_pattern, text, re.IGNORECASE)
-        
-        # Filter to ensure they look like real domains (not just any "word.com" pattern)
-        valid_domains = []
-        for match in matches:
-            full_match = re.search(r'(?:https?://)?(?:www\.)?' + re.escape(match), text, re.IGNORECASE)
-            if full_match:
-                # Verify it's a proper domain (not just a partial match)
-                full_domain = full_match.group(0)
-                # Check if it contains protocol or www prefix, or if it's a known domain pattern
-                if ('http' in full_domain.lower() or 
-                    'www.' in full_domain.lower() or 
-                    any(tld in full_domain.lower() for tld in ['.com', '.org', '.net', '.tv', '.io', '.co', '.uk', '.de', '.fr', '.ru'])):
-                    valid_domains.append(full_domain)
-        
-        # Return the first valid domain found, or None if none found
-        return valid_domains[0] if valid_domains else None
-
     def extract_domain_v2(self, text):
         """Enhanced domain extraction with better validation"""
-        # First, look for actual URLs
+        # Look for actual URLs or domains with common patterns
+        # This regex matches: http://domain.com, https://domain.com, www.domain.com
+        # But with stricter validation to avoid false positives
         url_pattern = r'(?:https?://)?(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
         matches = re.findall(url_pattern, text, re.IGNORECASE)
         
-        # Validate matches more carefully
+        # Validate matches more carefully - only match if it's part of a proper URL pattern
         for match in matches:
-            # Check if the match is part of a larger URL
+            # Look for the full match in context
             full_match = re.search(r'(?:https?://)?(?:www\.)?' + re.escape(match), text, re.IGNORECASE)
             if full_match:
                 full_url = full_match.group(0)
-                # Check if it's a proper domain pattern
+                # Check if it's a proper domain pattern by looking for common indicators
                 if ('http://' in full_url.lower() or 
                     'https://' in full_url.lower() or 
                     'www.' in full_url.lower() or
-                    any(full_url.lower().endswith(tld) for tld in ['.com', '.org', '.net', '.tv', '.io', '.co', '.uk', '.de', '.fr', '.ru', '.kim', '.xyz', '.top', '.site', '.info'])):
-                    return full_url
+                    any(tld in full_url.lower() for tld in ['.com', '.org', '.net', '.tv', '.io', '.co', '.uk', '.de', '.fr', '.ru', '.kim', '.xyz', '.top', '.site', '.info'])):
+                    # Additional validation: make sure it's not just a word.word pattern
+                    if len(match) > 6 and match.count('.') <= 2:  # At least 6 chars, max 2 dots
+                        return full_url
         
         return None
 
@@ -335,7 +330,7 @@ class QBittorrentMultiMonitor:
                 if domain in base_name:
                     # Remove the full domain match
                     cleaned_base = re.sub(re.escape(domain), '', cleaned_base, flags=re.IGNORECASE)
-                    # Clean up surrounding characters
+                    # Clean up surrounding characters but preserve meaningful separators
                     cleaned_base = re.sub(r'[-_.\[\](){}]+', ' ', cleaned_base)
                     cleaned_base = re.sub(r'\s+', ' ', cleaned_base).strip()
                 
@@ -350,7 +345,7 @@ class QBittorrentMultiMonitor:
                 cleaned_name = filename
                 if domain in filename:
                     cleaned_name = re.sub(re.escape(domain), '', cleaned_name, flags=re.IGNORECASE)
-                    # Clean up surrounding characters
+                    # Clean up surrounding characters but preserve meaningful separators
                     cleaned_name = re.sub(r'[-_.\[\](){}]+', ' ', cleaned_name)
                     cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
                 
