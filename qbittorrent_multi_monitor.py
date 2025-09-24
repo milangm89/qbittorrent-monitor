@@ -1,13 +1,28 @@
-import requests
+#!/usr/bin/env python3
+"""
+qBittorrent Multi-Instance Monitor
+
+A monitoring application that connects to multiple qBittorrent instances
+and automatically cleans torrent names by removing domain names and URLs
+from torrent titles, folders, and filenames.
+
+This module provides:
+- Multi-instance qBittorrent monitoring
+- Intelligent domain/URL extraction and removal
+- File and folder renaming with conflict handling
+- Robust error handling with exponential backoff
+- Comprehensive logging
+"""
+
+import logging
+import os
 import re
 import time
-import json
-import os
-from datetime import datetime
-import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configure logging
 logging.basicConfig(
@@ -20,7 +35,30 @@ logging.basicConfig(
 )
 
 class QBittorrentInstance:
-    def __init__(self, name, url, username, password, check_interval=30, max_retries=5, retry_delay=10, folder_retry_delay=30, connection_timeout=30):
+    """
+    Represents a single qBittorrent instance with monitoring and management capabilities.
+
+    This class handles connection, authentication, and operations for a single qBittorrent
+    instance, including torrent renaming, file operations, and error handling with
+    exponential backoff retry logic.
+
+    Attributes:
+        name (str): Friendly name for this instance
+        base_url (str): Base URL for the qBittorrent Web API
+        username (str): Authentication username
+        password (str): Authentication password
+        check_interval (int): Polling interval in seconds
+        max_retries (int): Maximum retry attempts for operations
+        retry_delay (int): Base delay between retries in seconds
+        folder_retry_delay (int): Extended delay for folder operations
+        connection_timeout (int): HTTP timeout in seconds
+        session (requests.Session): HTTP session for persistent connections
+        last_error_time (float): Timestamp of last error for backoff calculation
+        error_count (int): Consecutive error count for exponential backoff
+    """
+    def __init__(self, name, url, username, password, check_interval=30,
+                 max_retries=5, retry_delay=10, folder_retry_delay=30,
+                 connection_timeout=30):
         self.name = name
         self.base_url = url.rstrip('/')
         self.username = username
@@ -31,10 +69,8 @@ class QBittorrentInstance:
         self.folder_retry_delay = int(folder_retry_delay)
         self.connection_timeout = int(connection_timeout)
         self.session = requests.Session()
-        
+
         # Configure retry strategy
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
@@ -43,7 +79,7 @@ class QBittorrentInstance:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-        
+
         self.last_error_time = None
         self.error_count = 0
 
@@ -52,32 +88,31 @@ class QBittorrentInstance:
         try:
             login_data = {'username': self.username, 'password': self.password}
             response = self.session.post(
-                f'{self.base_url}/api/v2/auth/login', 
-                data=login_data, 
+                f'{self.base_url}/api/v2/auth/login',
+                data=login_data,
                 timeout=(10, self.connection_timeout)
             )
             if response.text == 'Ok.':
-                logging.info(f"[{self.name}] Successfully logged in to qBittorrent")
+                logging.info("[%s] Successfully logged in to qBittorrent", self.name)
                 self.last_error_time = None
                 self.error_count = 0
                 return True
-            else:
-                logging.error(f"[{self.name}] Failed to login to qBittorrent: {response.text}")
-                return False
+            logging.error("[%s] Failed to login to qBittorrent: %s", self.name, response.text)
+            return False
         except requests.exceptions.ConnectTimeout:
-            logging.error(f"[{self.name}] Connection timeout when connecting to {self.base_url}")
+            logging.error("[%s] Connection timeout when connecting to %s", self.name, self.base_url)
             self.handle_error()
             return False
         except requests.exceptions.ConnectionError as e:
-            logging.error(f"[{self.name}] Connection error when connecting to {self.base_url}: {e}")
+            logging.error("[%s] Connection error when connecting to %s: %s", self.name, self.base_url, e)
             self.handle_error()
             return False
         except requests.exceptions.Timeout as e:
-            logging.error(f"[{self.name}] Timeout when connecting to {self.base_url}: {e}")
+            logging.error("[%s] Timeout when connecting to %s: %s", self.name, self.base_url, e)
             self.handle_error()
             return False
         except Exception as e:
-            logging.error(f"[{self.name}] Unexpected error logging in: {e}")
+            logging.error("[%s] Unexpected error logging in: %s", self.name, e)
             self.handle_error()
             return False
 
@@ -91,35 +126,35 @@ class QBittorrentInstance:
         if self.last_error_time is None:
             return True
         # Exponential backoff: wait longer between retries
-        wait_time = min(300, 30 * (2 ** (self.error_count - 1)))  # Max 5 minutes
+        # Max 5 minutes
+        wait_time = min(300, 30 * (2 ** (self.error_count - 1)))
         return (time.time() - self.last_error_time) > wait_time
 
     def get_torrents(self):
         """Get list of all torrents"""
         try:
             response = self.session.get(
-                f'{self.base_url}/api/v2/torrents/info', 
+                f'{self.base_url}/api/v2/torrents/info',
                 timeout=(10, self.connection_timeout)
             )
             if response.status_code == 200:
                 return response.json()
-            else:
-                logging.error(f"[{self.name}] Failed to get torrents: HTTP {response.status_code}")
-                return []
+            logging.error("[%s] Failed to get torrents: HTTP %s", self.name, response.status_code)
+            return []
         except requests.exceptions.ConnectTimeout:
-            logging.error(f"[{self.name}] Connection timeout when fetching torrents from {self.base_url}")
+            logging.error("[%s] Connection timeout when fetching torrents from %s", self.name, self.base_url)
             self.handle_error()
             return []
         except requests.exceptions.ConnectionError as e:
-            logging.error(f"[{self.name}] Connection error when fetching torrents from {self.base_url}: {e}")
+            logging.error("[%s] Connection error when fetching torrents from %s: %s", self.name, self.base_url, e)
             self.handle_error()
             return []
         except requests.exceptions.Timeout as e:
-            logging.error(f"[{self.name}] Timeout when fetching torrents from {self.base_url}: {e}")
+            logging.error("[%s] Timeout when fetching torrents from %s: %s", self.name, self.base_url, e)
             self.handle_error()
             return []
         except Exception as e:
-            logging.error(f"[{self.name}] Error fetching torrents: {e}")
+            logging.error("[%s] Error fetching torrents: %s", self.name, e)
             self.handle_error()
             return []
 
@@ -127,41 +162,39 @@ class QBittorrentInstance:
         """Get files in a torrent"""
         try:
             response = self.session.get(
-                f'{self.base_url}/api/v2/torrents/files?hash={torrent_hash}', 
+                f'{self.base_url}/api/v2/torrents/files?hash={torrent_hash}',
                 timeout=(10, self.connection_timeout)
             )
             if response.status_code == 200:
                 return response.json()
-            else:
-                logging.error(f"[{self.name}] Failed to get files for torrent {torrent_hash}: HTTP {response.status_code}")
-                return []
+            logging.error("[%s] Failed to get files for torrent %s: HTTP %s", self.name, torrent_hash, response.status_code)
+            return []
         except requests.exceptions.ConnectTimeout:
-            logging.error(f"[{self.name}] Connection timeout when fetching files for torrent {torrent_hash}")
+            logging.error("[%s] Connection timeout when fetching files for torrent %s", self.name, torrent_hash)
             return []
         except requests.exceptions.ConnectionError as e:
-            logging.error(f"[{self.name}] Connection error when fetching files for torrent {torrent_hash}: {e}")
+            logging.error("[%s] Connection error when fetching files for torrent %s: %s", self.name, torrent_hash, e)
             return []
         except requests.exceptions.Timeout as e:
-            logging.error(f"[{self.name}] Timeout when fetching files for torrent {torrent_hash}: {e}")
+            logging.error("[%s] Timeout when fetching files for torrent %s: %s", self.name, torrent_hash, e)
             return []
         except Exception as e:
-            logging.error(f"[{self.name}] Error fetching torrent files for {torrent_hash}: {e}")
+            logging.error("[%s] Error fetching torrent files for %s: %s", self.name, torrent_hash, e)
             return []
 
     def get_torrent_properties(self, torrent_hash):
         """Get torrent properties to check state"""
         try:
             response = self.session.get(
-                f'{self.base_url}/api/v2/torrents/properties?hash={torrent_hash}', 
+                f'{self.base_url}/api/v2/torrents/properties?hash={torrent_hash}',
                 timeout=(10, self.connection_timeout)
             )
             if response.status_code == 200:
                 return response.json()
-            else:
-                logging.debug(f"[{self.name}] Could not get properties for torrent {torrent_hash}: HTTP {response.status_code}")
-                return None
+            logging.debug("[%s] Could not get properties for torrent %s: HTTP %s", self.name, torrent_hash, response.status_code)
+            return None
         except Exception as e:
-            logging.debug(f"[{self.name}] Error getting torrent properties for {torrent_hash}: {e}")
+            logging.debug("[%s] Error getting torrent properties for %s: %s", self.name, torrent_hash, e)
             return None
 
     def pause_torrent(self, torrent_hash):
@@ -169,18 +202,17 @@ class QBittorrentInstance:
         try:
             data = {'hashes': torrent_hash}
             response = self.session.post(
-                f'{self.base_url}/api/v2/torrents/pause', 
-                data=data, 
+                f'{self.base_url}/api/v2/torrents/pause',
+                data=data,
                 timeout=(10, self.connection_timeout)
             )
             if response.status_code == 200:
-                logging.info(f"[{self.name}] Paused torrent {torrent_hash}")
+                logging.info("[%s] Paused torrent %s", self.name, torrent_hash)
                 return True
-            else:
-                logging.warning(f"[{self.name}] Failed to pause torrent {torrent_hash}: HTTP {response.status_code}")
-                return False
+            logging.warning("[%s] Failed to pause torrent %s: HTTP %s", self.name, torrent_hash, response.status_code)
+            return False
         except Exception as e:
-            logging.error(f"[{self.name}] Error pausing torrent {torrent_hash}: {e}")
+            logging.error("[%s] Error pausing torrent %s: %s", self.name, torrent_hash, e)
             return False
 
     def resume_torrent(self, torrent_hash):
@@ -188,18 +220,17 @@ class QBittorrentInstance:
         try:
             data = {'hashes': torrent_hash}
             response = self.session.post(
-                f'{self.base_url}/api/v2/torrents/resume', 
-                data=data, 
+                f'{self.base_url}/api/v2/torrents/resume',
+                data=data,
                 timeout=(10, self.connection_timeout)
             )
             if response.status_code == 200:
-                logging.info(f"[{self.name}] Resumed torrent {torrent_hash}")
+                logging.info("[%s] Resumed torrent %s", self.name, torrent_hash)
                 return True
-            else:
-                logging.warning(f"[{self.name}] Failed to resume torrent {torrent_hash}: HTTP {response.status_code}")
-                return False
+            logging.warning("[%s] Failed to resume torrent %s: HTTP %s", self.name, torrent_hash, response.status_code)
+            return False
         except Exception as e:
-            logging.error(f"[{self.name}] Error resuming torrent {torrent_hash}: {e}")
+            logging.error("[%s] Error resuming torrent %s: %s", self.name, torrent_hash, e)
             return False
 
     def rename_torrent(self, torrent_hash, new_name):
@@ -208,90 +239,104 @@ class QBittorrentInstance:
             try:
                 data = {'hash': torrent_hash, 'name': new_name}
                 response = self.session.post(
-                    f'{self.base_url}/api/v2/torrents/rename', 
-                    data=data, 
+                    f'{self.base_url}/api/v2/torrents/rename',
+                    data=data,
                     timeout=(10, self.connection_timeout)
                 )
                 if response.status_code == 200:
-                    logging.info(f"[{self.name}] Successfully renamed torrent {torrent_hash}")
+                    logging.info("[%s] Successfully renamed torrent %s", self.name, torrent_hash)
                     return True
-                else:
-                    logging.warning(f"[{self.name}] Failed to rename torrent {torrent_hash} (attempt {attempt + 1}): HTTP {response.status_code}")
+                logging.warning("[%s] Failed to rename torrent %s (attempt %s): HTTP %s", self.name, torrent_hash, attempt + 1, response.status_code)
             except requests.exceptions.ConnectTimeout:
-                logging.error(f"[{self.name}] Connection timeout when renaming torrent {torrent_hash} (attempt {attempt + 1})")
+                logging.error("[%s] Connection timeout when renaming torrent %s (attempt %s)", self.name, torrent_hash, attempt + 1)
             except requests.exceptions.ConnectionError as e:
-                logging.error(f"[{self.name}] Connection error when renaming torrent {torrent_hash} (attempt {attempt + 1}): {e}")
+                logging.error("[%s] Connection error when renaming torrent %s (attempt %s): %s", self.name, torrent_hash, attempt + 1, e)
             except requests.exceptions.Timeout as e:
-                logging.error(f"[{self.name}] Timeout when renaming torrent {torrent_hash} (attempt {attempt + 1}): {e}")
+                logging.error("[%s] Timeout when renaming torrent %s (attempt %s): %s", self.name, torrent_hash, attempt + 1, e)
             except Exception as e:
-                logging.error(f"[{self.name}] Error renaming torrent {torrent_hash} (attempt {attempt + 1}): {e}")
-            
+                logging.error("[%s] Error renaming torrent %s (attempt %s): %s", self.name, torrent_hash, attempt + 1, e)
+
             if attempt < self.max_retries - 1:
                 time.sleep(self.retry_delay)
-        
+
         return False
 
     def rename_file(self, torrent_hash, old_path, new_path, is_folder=False):
         """Rename a file/folder in torrent with retry logic and torrent pausing for conflicts"""
         max_retries = self.max_retries
         retry_delay = self.retry_delay if not is_folder else self.folder_retry_delay
-        
+
         for attempt in range(max_retries):
             try:
                 data = {'hash': torrent_hash, 'oldPath': old_path, 'newPath': new_path}
                 response = self.session.post(
-                    f'{self.base_url}/api/v2/torrents/renameFile', 
-                    data=data, 
+                    f'{self.base_url}/api/v2/torrents/renameFile',
+                    data=data,
                     timeout=(10, self.connection_timeout)
                 )
-                
+
                 if response.status_code == 200:
-                    logging.info(f"[{self.name}] Successfully renamed {'folder' if is_folder else 'file'} in torrent {torrent_hash}")
+                    logging.info("[%s] Successfully renamed %s in torrent %s", self.name, 'folder' if is_folder else 'file', torrent_hash)
                     return True
                 elif response.status_code == 409:
-                    logging.warning(f"[{self.name}] Conflict when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): File may be in use")
+                    logging.warning("[%s] Conflict when renaming %s %s (attempt %s): File may be in use", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1)
                     # If it's a folder and we're getting conflicts, try pausing the torrent first
                     if is_folder and attempt >= 2:  # Try pausing after 2 failed attempts
-                        logging.info(f"[{self.name}] Attempting to pause torrent {torrent_hash} before renaming folder...")
+                        logging.info("[%s] Attempting to pause torrent %s before renaming folder...", self.name, torrent_hash)
                         if self.pause_torrent(torrent_hash):
                             time.sleep(5)  # Wait for torrent to pause
                             # Try renaming again after pause
                             response_retry = self.session.post(
-                                f'{self.base_url}/api/v2/torrents/renameFile', 
-                                data=data, 
+                                f'{self.base_url}/api/v2/torrents/renameFile',
+                                data=data,
                                 timeout=(10, self.connection_timeout)
                             )
                             if response_retry.status_code == 200:
-                                logging.info(f"[{self.name}] Successfully renamed {'folder' if is_folder else 'file'} after pausing torrent")
+                                logging.info("[%s] Successfully renamed %s after pausing torrent", self.name, 'folder' if is_folder else 'file')
                                 self.resume_torrent(torrent_hash)  # Resume after successful rename
                                 return True
                             else:
                                 # Resume torrent even if rename failed
                                 self.resume_torrent(torrent_hash)
                         else:
-                            logging.error(f"[{self.name}] Failed to pause torrent {torrent_hash}")
+                            logging.error("[%s] Failed to pause torrent %s", self.name, torrent_hash)
                 elif response.status_code == 400:
-                    logging.error(f"[{self.name}] Bad request when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): {response.text}")
+                    logging.error("[%s] Bad request when renaming %s %s (attempt %s): %s", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1, response.text)
                     break  # Don't retry on bad requests
                 else:
-                    logging.warning(f"[{self.name}] Failed to rename {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): HTTP {response.status_code}")
-                    
+                    logging.warning("[%s] Failed to rename %s %s (attempt %s): HTTP %s", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1, response.status_code)
+
             except requests.exceptions.ConnectTimeout:
-                logging.error(f"[{self.name}] Connection timeout when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1})")
+                logging.error("[%s] Connection timeout when renaming %s %s (attempt %s)", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1)
             except requests.exceptions.ConnectionError as e:
-                logging.error(f"[{self.name}] Connection error when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): {e}")
+                logging.error("[%s] Connection error when renaming %s %s (attempt %s): %s", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1, e)
             except requests.exceptions.Timeout as e:
-                logging.error(f"[{self.name}] Timeout when renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): {e}")
+                logging.error("[%s] Timeout when renaming %s %s (attempt %s): %s", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1, e)
             except Exception as e:
-                logging.error(f"[{self.name}] Error renaming {'folder' if is_folder else 'file'} {old_path} (attempt {attempt + 1}): {e}")
-            
+                logging.error("[%s] Error renaming %s %s (attempt %s): %s", self.name, 'folder' if is_folder else 'file', old_path, attempt + 1, e)
+
             if attempt < max_retries - 1:
-                logging.info(f"[{self.name}] Waiting {retry_delay} seconds before retry...")
+                logging.info("[%s] Waiting %s seconds before retry...", self.name, retry_delay)
                 time.sleep(retry_delay)
-        
+
         return False
 
 class QBittorrentMultiMonitor:
+    """
+    Multi-instance qBittorrent monitoring system.
+
+    This class manages multiple qBittorrent instances, coordinating monitoring
+    operations across all configured instances. It loads configuration from
+    environment variables and runs concurrent monitoring threads.
+
+    The monitor automatically detects domain names and URLs in torrent names,
+    folder names, and filenames, then removes them to create cleaner, more
+    readable torrent content names.
+
+    Attributes:
+        instances (List[QBittorrentInstance]): List of configured qBittorrent instances
+        running (bool): Flag indicating if monitoring is active
+    """
     def __init__(self):
         self.instances = self.load_instances_from_env()
         self.running = False
@@ -299,24 +344,28 @@ class QBittorrentMultiMonitor:
     def load_instances_from_env(self):
         """Load qBittorrent instances from environment variables"""
         instances = []
-        
+
         # Look for environment variables with pattern QBITTORRENT_<INDEX>_<PROPERTY>
         index = 0
         while True:
             url_var = f'QBITTORRENT_{index}_URL'
             if url_var not in os.environ:
                 break
-                
+
             url = os.environ[url_var]
             name = os.environ.get(f'QBITTORRENT_{index}_NAME', f'qbit-{index}')
             username = os.environ.get(f'QBITTORRENT_{index}_USERNAME', 'admin')
             password = os.environ.get(f'QBITTORRENT_{index}_PASSWORD', 'adminadmin')
-            check_interval = os.environ.get(f'QBITTORRENT_{index}_CHECK_INTERVAL', '30')
-            max_retries = os.environ.get(f'QBITTORRENT_{index}_MAX_RETRIES', '8')  # Increased retries
-            retry_delay = os.environ.get(f'QBITTORRENT_{index}_RETRY_DELAY', '15')
-            folder_retry_delay = os.environ.get(f'QBITTORRENT_{index}_FOLDER_RETRY_DELAY', '45')  # Increased for folders
-            connection_timeout = os.environ.get(f'QBITTORRENT_{index}_CONNECTION_TIMEOUT', '30')
-            
+            check_interval = int(os.environ.get(f'QBITTORRENT_{index}_CHECK_INTERVAL', '30'))
+            max_retries = int(os.environ.get(f'QBITTORRENT_{index}_MAX_RETRIES', '8'))
+            retry_delay = int(os.environ.get(f'QBITTORRENT_{index}_RETRY_DELAY', '15'))
+            folder_retry_delay = int(os.environ.get(
+                f'QBITTORRENT_{index}_FOLDER_RETRY_DELAY', '45'
+            ))
+            connection_timeout = int(os.environ.get(
+                f'QBITTORRENT_{index}_CONNECTION_TIMEOUT', '30'
+            ))
+
             instance = QBittorrentInstance(
                 name=name,
                 url=url,
@@ -328,14 +377,14 @@ class QBittorrentMultiMonitor:
                 folder_retry_delay=folder_retry_delay,
                 connection_timeout=connection_timeout
             )
-            
+
             instances.append(instance)
-            logging.info(f"Added qBittorrent instance: {name} ({url})")
+            logging.info("Added qBittorrent instance: %s (%s)", name, url)
             index += 1
-        
+
         if not instances:
             logging.warning("No qBittorrent instances configured via environment variables")
-            
+
         return instances
 
     def extract_domain_v2(self, text):
@@ -343,51 +392,51 @@ class QBittorrentMultiMonitor:
         # Look for actual URLs or domains with common patterns
         url_pattern = r'(?:https?://)?(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?'
         matches = re.findall(url_pattern, text, re.IGNORECASE)
-        
+
         for match in matches:
             full_match = re.search(r'(?:https?://)?(?:www\.)?' + re.escape(match), text, re.IGNORECASE)
             if full_match:
                 full_url = full_match.group(0)
-                if ('http://' in full_url.lower() or 
-                    'https://' in full_url.lower() or 
+                if ('http://' in full_url.lower() or
+                    'https://' in full_url.lower() or
                     'www.' in full_url.lower() or
                     any(tld in full_url.lower() for tld in ['.com', '.org', '.net', '.tv', '.io', '.co', '.uk', '.de', '.fr', '.ru', '.kim', '.xyz', '.top', '.site', '.info'])):
                     if len(match) > 6 and match.count('.') <= 2:
                         return full_url
-        
+
         return None
 
     def clean_name(self, name, domain):
         """Remove domain from name while preserving file extensions"""
         if not domain:
             return name
-            
+
         try:
             # Split the name to preserve file extension (for files, not folders)
             path_parts = name.split('/')
             filename = path_parts[-1]
             directory_path = '/'.join(path_parts[:-1]) if len(path_parts) > 1 else ''
-            
+
             # Check if this looks like a file (has extension) or folder
             file_parts = filename.rsplit('.', 1)
             is_file = (len(file_parts) > 1 and len(file_parts[1]) <= 6 and len(file_parts[1]) > 0)
-            
+
             if is_file:
                 # Handle file: preserve extension
                 base_name = file_parts[0]
                 file_extension = '.' + file_parts[1]
-                
+
                 # Remove domain from base name only
                 cleaned_base = base_name
                 if domain in base_name:
                     cleaned_base = re.sub(re.escape(domain), '', cleaned_base, flags=re.IGNORECASE)
                     cleaned_base = re.sub(r'[-_.\[\](){}]+', ' ', cleaned_base)
                     cleaned_base = re.sub(r'\s+', ' ', cleaned_base).strip()
-                
+
                 # Handle case where cleaning results in empty string
                 if not cleaned_base:
                     cleaned_base = base_name
-                
+
                 # Reconstruct filename with preserved extension
                 final_name = cleaned_base + file_extension
             else:
@@ -397,18 +446,18 @@ class QBittorrentMultiMonitor:
                     cleaned_name = re.sub(re.escape(domain), '', cleaned_name, flags=re.IGNORECASE)
                     cleaned_name = re.sub(r'[-_.\[\](){}]+', ' ', cleaned_name)
                     cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
-                
+
                 final_name = cleaned_name if cleaned_name else filename
-            
+
             # Reconstruct full path
             if directory_path:
                 result = directory_path + '/' + final_name
             else:
                 result = final_name
-                
+
             return result if result != name else name
         except Exception as e:
-            logging.error(f"[Generic] Error cleaning name '{name}': {e}")
+            logging.error("[Generic] Error cleaning name '%s': %s", name, e)
             return name
 
     def get_unique_paths(self, files):
@@ -427,20 +476,20 @@ class QBittorrentMultiMonitor:
     def process_torrent_paths(self, instance, torrent_hash, files):
         """Process all paths (folders and files) in a torrent"""
         processed_count = 0
-        
+
         # Get unique folder paths
         folder_paths = self.get_unique_paths(files)
-        logging.debug(f"[{instance.name}] Found folder paths: {folder_paths}")
-        
+        logging.debug("[%s] Found folder paths: %s", instance.name, folder_paths)
+
         # Process folders (from deepest to shallowest to avoid conflicts)
         sorted_folders = sorted(folder_paths, key=lambda x: x.count('/'), reverse=True)
-        
+
         for folder_path in sorted_folders:
             domain_in_folder = self.extract_domain_v2(folder_path)
             if domain_in_folder:
                 new_folder_path = self.clean_name(folder_path, domain_in_folder)
                 if new_folder_path != folder_path:
-                    logging.info(f'[{instance.name}]   Renaming folder: "{folder_path}" -> "{new_folder_path}"')
+                    logging.info("[%s]   Renaming folder: \"%s\" -> \"%s\"", instance.name, folder_path, new_folder_path)
                     if instance.rename_file(torrent_hash, folder_path, new_folder_path, is_folder=True):
                         processed_count += 1
                         # Update file paths to reflect folder renaming
@@ -448,12 +497,12 @@ class QBittorrentMultiMonitor:
                             if file['name'].startswith(folder_path + '/'):
                                 file['name'] = new_folder_path + file['name'][len(folder_path):]
                     else:
-                        logging.error(f'[{instance.name}]   Failed to rename folder: "{folder_path}"')
+                        logging.error("[%s]   Failed to rename folder: \"%s\"", instance.name, folder_path)
                 else:
-                    logging.debug(f'[{instance.name}]   Folder name unchanged: "{folder_path}"')
+                    logging.debug("[%s]   Folder name unchanged: \"%s\"", instance.name, folder_path)
             else:
-                logging.debug(f'[{instance.name}]   No domain found in folder: "{folder_path}"')
-        
+                logging.debug("[%s]   No domain found in folder: \"%s\"", instance.name, folder_path)
+
         # Process files (with updated paths if folders were renamed)
         for file in files:
             file_name = file['name']
@@ -461,83 +510,82 @@ class QBittorrentMultiMonitor:
             if domain_in_file:
                 new_file_name = self.clean_name(file_name, domain_in_file)
                 if new_file_name != file_name:
-                    logging.info(f'[{instance.name}]   Renaming file: "{file_name}" -> "{new_file_name}"')
+                    logging.info("[%s]   Renaming file: \"%s\" -> \"%s\"", instance.name, file_name, new_file_name)
                     if instance.rename_file(torrent_hash, file_name, new_file_name, is_folder=False):
                         processed_count += 1
                     else:
-                        logging.error(f'[{instance.name}]   Failed to rename file: "{file_name}"')
+                        logging.error("[%s]   Failed to rename file: \"%s\"", instance.name, file_name)
                 else:
-                    logging.debug(f'[{instance.name}]   File name unchanged: "{file_name}"')
+                    logging.debug("[%s]   File name unchanged: \"%s\"", instance.name, file_name)
             else:
-                logging.debug(f'[{instance.name}]   No domain found in file: "{file_name}"')
-                
+                logging.debug("[%s]   No domain found in file: \"%s\"", instance.name, file_name)
+
         return processed_count
 
     def process_torrent(self, instance, torrent):
         """Process a single torrent"""
         torrent_name = torrent['name']
         torrent_hash = torrent['hash']
-        
-        logging.info(f"[{instance.name}] Processing torrent: {torrent_name} ({torrent_hash})")
-        
+
+        logging.info("[%s] Processing torrent: %s (%s)", instance.name, torrent_name, torrent_hash)
+
         # Check if torrent name contains a domain
         domain = self.extract_domain_v2(torrent_name)
-        torrent_renamed = False
-        
+
         if domain:
             new_torrent_name = self.clean_name(torrent_name, domain)
             if new_torrent_name != torrent_name:
-                logging.info(f'[{instance.name}] Renaming torrent: "{torrent_name}" -> "{new_torrent_name}"')
-                torrent_renamed = instance.rename_torrent(torrent_hash, new_torrent_name)
+                logging.info("[%s] Renaming torrent: \"%s\" -> \"%s\"", instance.name, torrent_name, new_torrent_name)
+                instance.rename_torrent(torrent_hash, new_torrent_name)
             else:
-                logging.debug(f'[{instance.name}] Torrent name unchanged: "{torrent_name}"')
+                logging.debug("[%s] Torrent name unchanged: \"%s\"", instance.name, torrent_name)
         else:
-            logging.debug(f'[{instance.name}] No domain found in torrent name: "{torrent_name}"')
-        
+            logging.debug("[%s] No domain found in torrent name: \"%s\"", instance.name, torrent_name)
+
         # Process files and folders in torrent
-        logging.info(f"[{instance.name}] Fetching files for torrent {torrent_hash}")
+        logging.info("[%s] Fetching files for torrent %s", instance.name, torrent_hash)
         files = instance.get_torrent_files(torrent_hash)
-        
+
         if files:
-            logging.info(f"[{instance.name}] Found {len(files)} files in torrent")
+            logging.info("[%s] Found %s files in torrent", instance.name, len(files))
             files_processed = self.process_torrent_paths(instance, torrent_hash, files)
-            logging.info(f"[{instance.name}] Processed {files_processed} paths in torrent {torrent_hash}")
+            logging.info("[%s] Processed %s paths in torrent %s", instance.name, files_processed, torrent_hash)
         else:
-            logging.warning(f"[{instance.name}] No files found for torrent {torrent_hash}")
+            logging.warning("[%s] No files found for torrent %s", instance.name, torrent_hash)
 
     def monitor_instance(self, instance):
         """Monitor a single qBittorrent instance"""
-        logging.info(f"[{instance.name}] Starting monitor for {instance.base_url}")
-        
+        logging.info("[%s] Starting monitor for %s", instance.name, instance.base_url)
+
         # Login initially
         if not instance.login():
-            logging.error(f"[{instance.name}] Failed initial login, will retry later")
-        
+            logging.error("[%s] Failed initial login, will retry later", instance.name)
+
         while self.running:
             try:
                 if not instance.should_retry():
                     time.sleep(30)
                     continue
-                    
+
                 # Try to get torrents
                 torrents = instance.get_torrents()
                 if not torrents:
                     if instance.should_retry():
-                        logging.warning(f"[{instance.name}] No torrents returned, retrying...")
+                        logging.warning("[%s] No torrents returned, retrying...", instance.name)
                         time.sleep(instance.check_interval)
                     continue
-                
+
                 # Process torrents
                 for torrent in torrents:
                     try:
                         self.process_torrent(instance, torrent)
                     except Exception as e:
-                        logging.error(f"[{instance.name}] Error processing torrent {torrent.get('hash', 'unknown')}: {e}")
-                
+                        logging.error("[%s] Error processing torrent %s: %s", instance.name, torrent.get('hash', 'unknown'), e)
+
                 time.sleep(instance.check_interval)
-                
+
             except Exception as e:
-                logging.error(f"[{instance.name}] Error in monitoring loop: {e}")
+                logging.error("[%s] Error in monitoring loop: %s", instance.name, e)
                 instance.handle_error()
                 time.sleep(60)
 
@@ -546,14 +594,14 @@ class QBittorrentMultiMonitor:
         if not self.instances:
             logging.error("No instances to monitor")
             return
-            
+
         self.running = True
-        logging.info(f"Starting multi-instance monitor for {len(self.instances)} qBittorrent servers")
-        
+        logging.info("Starting multi-instance monitor for %s qBittorrent servers", len(self.instances))
+
         # Use ThreadPoolExecutor to run each instance monitor in parallel
         with ThreadPoolExecutor(max_workers=len(self.instances)) as executor:
             futures = [executor.submit(self.monitor_instance, instance) for instance in self.instances]
-            
+
             try:
                 # Wait for all threads
                 for future in futures:
@@ -563,8 +611,10 @@ class QBittorrentMultiMonitor:
                 self.running = False
 
 def main():
+    """Main entry point for the qBittorrent multi-instance monitor application."""
     monitor = QBittorrentMultiMonitor()
     monitor.start()
 
 if __name__ == '__main__':
     main()
+
