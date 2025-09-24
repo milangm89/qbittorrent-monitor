@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY qbittorrent_monitor_env.py .
+COPY qbittorrent_multi_monitor.py .
 
 # Create directories
 RUN mkdir -p /app/logs
@@ -20,4 +20,4 @@ USER appuser
 
 VOLUME ["/app/logs"]
 
-CMD ["python", "qbittorrent_monitor_env.py"]
+CMD ["python", "qbittorrent_multi_monitor.py"]
