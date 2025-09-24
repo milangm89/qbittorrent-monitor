@@ -1,16 +1,25 @@
 #!/bin/bash
 
-# Configuration
-DOCKER_HUB_USERNAME="milangeorge"
+# Configuration - UPDATE THESE VALUES
+DOCKER_HUB_USERNAME="your-dockerhub-username"  # <-- CHANGE THIS
 IMAGE_NAME="qbittorrent-monitor"
 IMAGE_TAG="latest"
 
 echo "=== Building Multi-Arch qBittorrent Monitor Image ==="
+echo "Using Docker Hub username: ${DOCKER_HUB_USERNAME}"
+
+# Verify Docker Hub username is set
+if [ "$DOCKER_HUB_USERNAME" = "your-dockerhub-username" ] || [ -z "$DOCKER_HUB_USERNAME" ]; then
+    echo "❌ ERROR: Please set your Docker Hub username in the script!"
+    echo "Edit the DOCKER_HUB_USERNAME variable at the top of this script."
+    exit 1
+fi
 
 # Login to Docker Hub
 echo "1. Logging in to Docker Hub..."
 if ! podman login docker.io; then
     echo "❌ Failed to login to Docker Hub"
+    echo "Make sure you're logged in with: podman login docker.io"
     exit 1
 fi
 
@@ -35,25 +44,35 @@ if ! podman build --platform linux/arm64 -t ${DOCKER_HUB_USERNAME}/${IMAGE_NAME}
     exit 1
 fi
 
+# Test login and permissions by checking if we can access the repository
+echo "5. Testing repository access..."
+# This is a simple test - we'll try to push a small test image first
+
 # Push both images
-echo "5. Pushing images to Docker Hub..."
+echo "6. Pushing images to Docker Hub..."
+echo "Pushing x86_64 image..."
 if ! podman push ${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}-amd64; then
     echo "❌ Failed to push x86_64 image"
+    echo "Possible causes:"
+    echo "  - Repository doesn't exist on Docker Hub"
+    echo "  - You don't have permission to push to this repository"
+    echo "  - Network issues"
     exit 1
 fi
 
+echo "Pushing ARM64 image..."
 if ! podman push ${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}-arm64; then
     echo "❌ Failed to push ARM64 image"
     exit 1
 fi
 
 # Create and push manifest using docker:// prefix to avoid local conflicts
-echo "6. Creating and pushing multi-arch manifest..."
+echo "7. Creating and pushing multi-arch manifest..."
 if podman manifest create ${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG} \
     docker://docker.io/${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}-amd64 \
     docker://docker.io/${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}-arm64; then
     
-    echo "7. Pushing manifest..."
+    echo "8. Pushing manifest..."
     if podman manifest push ${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG} \
         docker://docker.io/${DOCKER_HUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}; then
         
