@@ -279,24 +279,113 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
 
         return False
 
-    def _attempt_rename_with_pause(self, torrent_hash, data):
-        """Helper method to attempt rename after pausing torrent"""
-        if not self.pause_torrent(torrent_hash):
-            return False
-
-        time.sleep(5)  # Wait for torrent to pause
+    def get_torrent_state(self, torrent_hash):
+        """Get the current state of a torrent"""
         try:
-            response_retry = self.session.post(
-                f'{self.base_url}/api/v2/torrents/renameFile',
+            response = self.session.get(
+                f'{self.base_url}/api/v2/torrents/info?hashes={torrent_hash}',
+                timeout=(10, self.connection_timeout)
+            )
+            if response.status_code == 200:
+                torrents = response.json()
+                if torrents:
+                    state = torrents[0].get('state', 'unknown')
+                    progress = torrents[0].get('progress', 0)
+                    logging.debug("[%s] Torrent %s state: %s (%.1f%% complete)", 
+                                 self.name, torrent_hash, state, progress * 100)
+                    return state, progress
+            return 'unknown', 0
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.error("[%s] Error getting torrent state for %s: %s", 
+                         self.name, torrent_hash, e)
+            return 'unknown', 0
+
+    def _force_complete_torrent(self, torrent_hash):
+        """Force complete a torrent to release file locks"""
+        try:
+            data = {'hashes': torrent_hash}
+            response = self.session.post(
+                f'{self.base_url}/api/v2/torrents/setForceStart',
                 data=data,
                 timeout=(10, self.connection_timeout)
             )
-            success = response_retry.status_code == 200
-            if success:
-                logging.info("[%s] Successfully renamed after pausing torrent", self.name)
-            return success
-        finally:
-            self.resume_torrent(torrent_hash)  # Always resume
+            if response.status_code == 200:
+                logging.info("[%s] Force started torrent %s", self.name, torrent_hash)
+                time.sleep(2)  # Wait a bit
+                # Now pause it
+                self.pause_torrent(torrent_hash)
+                return True
+            return False
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.error("[%s] Error force starting torrent %s: %s", self.name, torrent_hash, e)
+            return False
+
+    def _attempt_rename_with_pause(self, torrent_hash, data, attempt=0):
+        """Helper method to attempt rename after pausing torrent with aggressive strategies"""
+        # First, check torrent state to understand what we're dealing with
+        state, progress = self.get_torrent_state(torrent_hash)
+        logging.info("[%s] Before aggressive rename - Torrent state: %s (%.1f%% complete)", 
+                    self.name, state, progress * 100)
+        
+        strategies = [
+            ("pause", lambda: self.pause_torrent(torrent_hash)),
+            ("force_complete_then_pause", lambda: self._force_complete_torrent(torrent_hash)),
+        ]
+        
+        for strategy_name, strategy_func in strategies:
+            logging.info("[%s] Trying strategy '%s' for torrent %s", 
+                        self.name, strategy_name, torrent_hash)
+            
+            if not strategy_func():
+                logging.warning("[%s] Strategy '%s' failed", self.name, strategy_name)
+                continue
+            
+            # Wait longer for folders as they might have more file handles
+            # Also wait longer if torrent is actively downloading/seeding
+            base_wait = 10 if attempt > 0 else 5
+            if state in ['downloading', 'uploading', 'stalledDL', 'stalledUP']:
+                base_wait *= 2
+            
+            logging.info("[%s] Waiting %s seconds after %s (torrent was %s)...", 
+                        self.name, base_wait, strategy_name, state)
+            time.sleep(base_wait)
+            
+            # Check state again after our strategy
+            new_state, _ = self.get_torrent_state(torrent_hash)
+            logging.debug("[%s] After %s strategy - Torrent state: %s", 
+                         self.name, strategy_name, new_state)
+            
+            try:
+                response_retry = self.session.post(
+                    f'{self.base_url}/api/v2/torrents/renameFile',
+                    data=data,
+                    timeout=(10, self.connection_timeout)
+                )
+                
+                if response_retry.status_code == 200:
+                    logging.info("[%s] Successfully renamed after %s strategy", 
+                               self.name, strategy_name)
+                    return True
+                elif response_retry.status_code == 409:
+                    logging.warning("[%s] Still getting conflict after %s strategy, "
+                                   "torrent state: %s", self.name, strategy_name, new_state)
+                else:
+                    logging.warning("[%s] Got HTTP %s after %s strategy", 
+                                  self.name, response_retry.status_code, strategy_name)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.error("[%s] Error during rename after %s: %s", 
+                             self.name, strategy_name, e)
+            finally:
+                # Always try to resume the torrent
+                self.resume_torrent(torrent_hash)
+            
+            # Small delay before trying next strategy
+            if strategy_name != strategies[-1][0]:  # Not the last strategy
+                time.sleep(3)
+        
+        logging.error("[%s] All aggressive strategies exhausted for torrent %s", 
+                     self.name, torrent_hash)
+        return False
 
     def _handle_rename_response(self, response, torrent_hash, old_path, new_path,  # pylint: disable=too-many-arguments,too-many-positional-arguments
                                is_folder, attempt):
@@ -307,16 +396,33 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
             return True, False  # success, should_break
 
         if response.status_code == 409:
-            logging.warning("[%s] Conflict when renaming %s %s (attempt %s): "
-                           "File may be in use", self.name,
-                           'folder' if is_folder else 'file', old_path, attempt + 1)
-            # If it's a folder and we're getting conflicts, try pausing the torrent first
-            if is_folder and attempt >= 2:  # Try pausing after 2 failed attempts
-                logging.info("[%s] Attempting to pause torrent %s before "
-                            "renaming folder...", self.name, torrent_hash)
+            # Get torrent state to better understand the conflict
+            state, progress = self.get_torrent_state(torrent_hash)
+            
+            logging.warning("[%s] Conflict when renaming %s '%s' (attempt %s): "
+                           "File may be in use. Torrent state: %s (%.1f%% complete)", 
+                           self.name, 'folder' if is_folder else 'file', old_path, 
+                           attempt + 1, state, progress * 100)
+            
+            # For folders, be more aggressive - try pausing immediately
+            # For files, wait until attempt 2 as before
+            should_try_pause = is_folder or attempt >= 1
+            
+            if should_try_pause:
+                logging.info("[%s] Attempting aggressive rename strategies for %s '%s' "
+                            "(torrent state: %s)...", 
+                            self.name, 'folder' if is_folder else 'file', old_path, state)
                 data = {'hash': torrent_hash, 'oldPath': old_path, 'newPath': new_path}
-                if self._attempt_rename_with_pause(torrent_hash, data):
+                if self._attempt_rename_with_pause(torrent_hash, data, attempt):
                     return True, False  # success, should_break
+                else:
+                    logging.error("[%s] All aggressive strategies failed for %s '%s'", 
+                                 self.name, 'folder' if is_folder else 'file', old_path)
+            else:
+                logging.info("[%s] Skipping aggressive strategies for now (attempt %s/%s), "
+                            "will try on next attempt", 
+                            self.name, attempt + 1, 5)  # Assuming max 5 retries
+            
             return False, False  # no success, continue trying
 
         if response.status_code == 400:
@@ -366,8 +472,14 @@ class QBittorrentInstance:  # pylint: disable=too-many-instance-attributes
                              self.name, 'folder' if is_folder else 'file', old_path, attempt + 1, e)
 
             if attempt < max_retries - 1:
-                logging.info("[%s] Waiting %s seconds before retry...", self.name, retry_delay)
-                time.sleep(retry_delay)
+                # Use longer delays for folders after conflicts, especially aggressive ones
+                effective_delay = retry_delay
+                if is_folder and attempt > 0:
+                    effective_delay = min(retry_delay * 2, 60)  # Double delay but max 60 seconds
+                
+                logging.info("[%s] Waiting %s seconds before retry (attempt %s/%s)...", 
+                           self.name, effective_delay, attempt + 1, max_retries)
+                time.sleep(effective_delay)
 
         return False
 
